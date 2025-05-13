@@ -46,9 +46,9 @@ async def make_ine_request(urlBase: str, language: str, function: str, input_str
 
     logger.info(f"Requesting INE API: {url}, params: {params}")
     
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            response = await client.get(url, params=params, timeout=30.0, follow_redirects=True)
+            response = await client.get(url, params=params, timeout=30.0)
             response.raise_for_status()
             # Handle encoding properly
             response.encoding = 'utf-8'
