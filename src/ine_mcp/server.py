@@ -48,7 +48,7 @@ async def make_ine_request(urlBase: str, language: str, function: str, input_str
     
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url, params=params, timeout=30.0)
+            response = await client.get(url, params=params, timeout=30.0, follow_redirects=True)
             response.raise_for_status()
             # Handle encoding properly
             response.encoding = 'utf-8'
@@ -475,7 +475,7 @@ async def get_publication_date(language: str, input_str: Optional[str] = None, p
 
     Args:
         language (str): puede ser ES o EN.
-        Input (str): Código identificativo de la publicación. Para obtener una lista de las publicaciones usar la mcp tool get_publications o a get_publications_operation
+        Input (str): Código identificativo de la publicación. Para obtener una lista de las publicaciones usar las mcp tools get_publications y get_publications_operation
         params (dict). Pueden ser los siguientes:
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos son 0, 1 y 2.
             tip: obtener la respuesta de las peticiones de modo más amigable (‘A’).
