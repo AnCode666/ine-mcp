@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ine_mcp"
-version = "0.1.2"
+version = "0.1.3"
 description = "INE API integration with MCP (Model Context Protocol)"
 readme = "README.md"
 requires-python = ">=3.10"
