@@ -1,7 +1,9 @@
 import logging
-from typing import Optional
+from typing import Optional, List, Dict
 from mcp.server.fastmcp import FastMCP
 import httpx
+import re
+import difflib
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO)
@@ -17,8 +19,12 @@ mcp = FastMCP(
 INE_API_URL_BASE = "https://servicios.ine.es/wstempus/js"
 INE_API_URL_BASE_cache = "https://servicios.ine.es/wstempus/jsCache"
 
-
-async def make_ine_request(urlBase: str, language: str, function: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+async def make_ine_request(
+        urlBase: str,
+        language: str,
+        function: str,
+        input_str: Optional[str] = None,
+        params: Optional[dict] = None) -> dict:
     """
     Realiza una petición a la API del INE.
 
@@ -34,23 +40,23 @@ async def make_ine_request(urlBase: str, language: str, function: str, input_str
     """
     # Construcción correcta de URL según docs INE:
     # https://servicios.ine.es/wstempus/js/{idioma}/{función}/{input}[?parámetros]
-    url = None
     if input_str and params:
-        url = f"{urlBase}/{language}/{function}/{input_str}?{params.pop("Id", None)}"
+        url = f"{urlBase}/{language}/{function}/{input_str}?{params.pop('Id', None)}"
     elif not input_str and not params:
         url = f"{urlBase}/{language}/{function}"
     elif not input_str and params:
-        url = f"{urlBase}/{language}/{function}?{params.pop("Id", None)}"
+        url = f"{urlBase}/{language}/{function}?{params.pop('Id', None)}"
     elif input_str and not params:
         url = f"{urlBase}/{language}/{function}/{input_str}"
+    else:
+        raise ValueError("URL mal construida.")
 
     logger.info(f"Requesting INE API: {url}, params: {params}")
-    
+
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
             response = await client.get(url, params=params, timeout=30.0)
             response.raise_for_status()
-            # Handle encoding properly
             response.encoding = 'utf-8'
             return response.json()
         except httpx.RequestError as e:
@@ -60,61 +66,72 @@ async def make_ine_request(urlBase: str, language: str, function: str, input_str
             logger.error(f"INE API error: {str(e)}")
             raise
 
-# -------------------MCP TOOLS-------------------
-
-@mcp.tool() #OK
-async def get_ine_data(language: str, function: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+def filter_dict_by_nombre(
+    jsonDataFromAPI: Dict,
+    terms: List[str],
+    use_regex: bool = False,
+    use_fuzzy: bool = False,
+    fuzzy_threshold: float = 0.7
+) -> List[Dict]:
     """
-    Realiza una petición a la API del INE.
+    Filtra operaciones, publicaciones, tablas, etc por coincidencias en "Nombre" usando prioridad:
+    regex > fuzzy > substring.
 
     Args:
-        language (str): puede ser ES o EN.
-        function (str): Funciones implementadas en la API del INE para hacer consultas. Son las siguientes:
-            DATOS_TABLA: Obtener datos para una tabla específica.
-            DATOS_SERIE: Obtener datos para una serie específica.
-            DATOS_METADATAOPERACION: Obtener datos de series pertenecientes a una operación dada utilizando un filtro.
-            OPERACIONES_DISPONIBLES: Obtener todas las operaciones disponibles.
-            OPERACION: Obtener una operación.
-            VARIABLES: Obtener todas las variables disponibles.
-            VARIABLES_OPERACION: Obtener todas las variables utilizadas en una operación dada.
-            VALORES_VARIABLE: Obtener todos los valores para una variable específica.
-            VALORES_VARIABLEOPERACION: Obtener todos los valores para una variable específica de una operación dada.
-            TABLAS_OPERACION: Obtener un listado de todas las tablas de una operación.
-            GRUPOS_TABLA: Obtener todos los grupos para una tabla específica. Una tabla está definida por diferentes grupos o combos de selección y cada uno de ellos por los valores que toman una o varias variables.
-            VALORES_GRUPOSTABLA: Obtener todos los valores de un grupo específico para una tabla dada. Una tabla está definida por diferentes grupos o combos de selección y cada uno de ellos por los valores que toman una o varias variables.
-            SERIE: Obtener una serie específica.
-            SERIES_OPERACION: Obtener todas las series de una operación.
-            VALORES_SERIE: Obtener los valores y variables que definen una serie.
-            SERIES_TABLA: Obtener todas las series de una tabla específica.
-            SERIE_METADATAOPERACION: Obtener series pertenecientes a una operación dada utilizando un filtro.
-            PERIODICIDADES: Obtener las periodicidades disponibles.
-            PUBLICACIONES: Obtener las publicaciones disponibles.
-
-        input_str (str): Identificadores de los elementos de entrada de las funciones. Los inputs varían en base a la función utilizada.
-        params (dict): Los parámetros en la URL se establecen a partir del símbolo ?. Cuando haya más de un parámetro, el símbolo & se utiliza como separador. No todas las funciones admiten todos los parámetros posibles.
+        jsonDataFromAPI (List[Dict]): Lista de operaciones, publicaciones, tablas, etc del INE.
+        terms (List[str]): Palabras clave o patrones.
+        use_regex (bool): Prioriza regex.
+        use_fuzzy (bool): Luego fuzzy matching si regex no activa.
+        fuzzy_threshold (float): Ratio mínimo para fuzzy.
 
     Returns:
-        dict (JSON): Respuesta JSON de la API
+        List[Dict]: Coincidencias únicas.
     """
+    matched_ids = set()
+    result = []
 
-    logger.info(f"get_ine_data, input_str: {input_str}")
-    logger.info(f"get_ine_data, params: {params}")
+    for op in jsonDataFromAPI:
+        nombre = op.get("Nombre", "")
+        for term in terms:
+            matched = False
 
-    return await make_ine_request(INE_API_URL_BASE, language, function, input_str, params)
+            if use_regex:
+                if re.search(term, nombre, re.IGNORECASE):
+                    matched = True
 
+            elif use_fuzzy:
+                ratio = difflib.SequenceMatcher(None, term.lower(), nombre.lower()).ratio()
+                if ratio >= fuzzy_threshold:
+                    matched = True
 
-@mcp.tool() # DATOS_TABLA OK
-async def get_table_data(language: str, input_str: str, params: Optional[dict] = None) -> dict:
+            else:
+                if term.lower() in nombre.lower():
+                    matched = True
+
+            if matched and op["Id"] not in matched_ids:
+                matched_ids.add(op["Id"])
+                result.append(op)
+                break
+
+    return result
+
+# -------------------MCP API TOOLS-------------------
+
+#INEbase / Lista completa de operaciones
+#Tempus3 / Lista completa de publicaciones
+
+@mcp.tool()
+async def get_DATOS_TABLA(language: str, input_str: str, params: Optional[dict] = None) -> dict:
     """
     Obtener datos para una tabla específica.
 
     Args:
-        language (str): puede ser ES o EN.
-        input_str (str): Código identificativo de la tabla. Para obtener el código de una tabla usar la mcp tool get_publications.
+        language (str): ES o EN.
+        input_str (str): Código identificativo de la tabla. Para obtenerlo usar la mcp tool get_and_filter_PUBLICACIONES.
         params (dict): Pueden ser los siguientes
             nult: devolver los n últimos datos o periodos.
-            det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos son 0, 1 y 2.
-            tip: obtener la respuesta de las peticiones de modo más amigable (‘A’), incluir metadatos (‘M’) o ambos (‘AM’)¨.
+            det: nivel de detalle de la información. 0, 1 ó 2.
+            tip: obtener la respuesta de modo más amigable (‘A’), incluir metadatos (‘M’) o ambos (‘AM’)¨.
             tv: parámetro para filtrar, utilizado con el formato tv=id_variable:id_valor. Más información en https://www.ine.es/dyngs/DAB/index.htm?cid=1102.
 
     Returns:
@@ -123,14 +140,14 @@ async def get_table_data(language: str, input_str: str, params: Optional[dict] =
 
     return await make_ine_request(INE_API_URL_BASE_cache, language, "DATOS_TABLA", input_str, params)
 
-@mcp.tool() # DATOS_SERIE
-async def get_series_data(language: str, input_str: str, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_DATOS_SERIE(language: str, input_str: str, params: Optional[dict] = None) -> dict:
     """
     Obtener datos para una serie específica.
 
     Args:
-        language (str): puede ser ES o EN.
-        input_str (str): Código identificativo de la serie. Para obtener el código de una serie usar la mcp tool get_publications.
+        language (str): ES o EN.
+        input_str (str): Código identificativo de la serie. Para obtenerlo usar la mcp tool get_and_filter_PUBLICACIONES.
         params (dict): Pueden ser los siguientes
             nult: devolver los n últimos datos o periodos.
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos son 0, 1 y 2.
@@ -143,13 +160,13 @@ async def get_series_data(language: str, input_str: str, params: Optional[dict] 
 
     return await make_ine_request(INE_API_URL_BASE_cache, language, "DATOS_SERIE", input_str, params)
 
-@mcp.tool() # DATOS_METADATAOPERACION
-async def get_series_metadata_operation(language: str, input_str: str, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_DATOS_METADATAOPERACION(language: str, input_str: str, params: Optional[dict] = None) -> dict:
     """
     Obtener datos de series pertenecientes a una operación dada utilizando un filtro.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         input_str (str): Código identificativo de la operación. Para consultar las operaciones disponibles usar la mcp tool get_available_operations
         params (dict): Pueden ser los siguientes:
             p: id de la periodicidad de las series. Periodicidades comunes: 1 (mensual), 3 (trimestral), 6 (semestral), 12 (anual). Para ver una lista de las periodicidades acceder a PERIODICIDADES.
@@ -165,37 +182,50 @@ async def get_series_metadata_operation(language: str, input_str: str, params: O
 
     return await make_ine_request(INE_API_URL_BASE, language, "DATOS_METADATAOPERACION", input_str, params)
 
-@mcp.tool() #OPERACIONES_DISPONIBLES OK
-async def get_available_operations(language: str, params: Optional[dict] = None) -> dict:
+@mcp.tool() #Ejecutar de primera
+async def get_and_filter_OPERACIONES_DISPONIBLES(
+    language: str,
+    params: Optional[dict] = None,
+    search_terms: Optional[List[str]] = None,
+    use_regex: bool = False
+) -> dict:
     """
-    Obtener todas las operaciones disponibles en la API del INE.
+    Obtener todas las operaciones disponibles en la API del INE, con posibilidad de filtrarlas.
 
     Args:
-        language (str): puede ser ES o EN.
-        params (dict): Pueden ser los siguientes
+        language (str): ES o EN.
+        params (dict): Pueden ser los siguientes:
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos del parámetro: 0, 1 y 2.
             geo: para obtener resultados en función del ámbito geográfico:
             geo=1: resultados por comunidades autónomas, provincias, municipios y otras desagregaciones.
             geo=0: resultados nacionales.
             page: la respuesta está paginada. Se ofrece un máximo de 500 elementos por página para no ralentizar la respuesta. Para consultar las páginas siguientes, se utiliza el parámetro page.
+        search_terms (List[str], optional): Lista de palabras clave o patrones a buscar.
+        use_regex (bool): Si True, activa búsqueda por expresión regular.
 
     Returns:
-        dict (JSON): Se obtienen los identificadores del elemento operación estadística. Existen tres códigos para la identificación de la operación estadística "Índice de Precios de Consumo (IPC)":
+        dict (JSON): Diccionario con todas las operaciones y las filtradas (si aplica). Existen tres códigos para la identificación de la operación estadística "Índice de Precios de Consumo (IPC)":
             código numérico Tempus3 interno (Id=25).
             código de la operación estadística en el Inventario de Operaciones Estadísticas (IOE30138).
             código alfabético Tempus3 interno (IPC).
     """
-    input=None
+    input = None
+    operaciones = await make_ine_request(INE_API_URL_BASE, language, "OPERACIONES_DISPONIBLES", input, params)
 
-    return await make_ine_request(INE_API_URL_BASE, language, "OPERACIONES_DISPONIBLES", input, params)
+    if search_terms:
+        filtradas = filter_dict_by_nombre(operaciones, search_terms, use_regex)
+        return {"operaciones filtradas": filtradas}
+    else:
+        #filtradas = []
+        return {"operaciones": operaciones}
 
-@mcp.tool() #OPERACION OK
-async def get_operation(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_OPERACION(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener una operación disponible en la API del INE.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         input_str (str): Código identificativo de la operación. Para consultar las operaciones disponibles usar la mcp tool get_available_operations
         params (dict): Pueden ser los siguientes
             det: nivel de detalle de la información mostrada. Valores válidos: 0, 1 y 2.
@@ -209,13 +239,13 @@ async def get_operation(language: str, input_str: Optional[str] = None, params: 
 
     return await make_ine_request(INE_API_URL_BASE, language, "OPERACION", input_str, params)
 
-@mcp.tool() #VARIABLES OK
-async def get_variables(language: str, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_VARIABLES(language: str, params: Optional[dict] = None) -> dict:
     """
     Obtener todas las variables disponibles.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         params (dict): Pueden ser los siguientes
             page: la respuesta está paginada. Se ofrece un máximo de 500 elementos por página para no ralentizar la respuesta. Para consultar las páginas siguientes, se utiliza el parámetro page.
     Returns:
@@ -225,13 +255,13 @@ async def get_variables(language: str, params: Optional[dict] = None) -> dict:
 
     return await make_ine_request(INE_API_URL_BASE, language, "VARIABLES", input, params)
 
-@mcp.tool() #VARIABLES_OPERACION OK
-async def get_variables_operation(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_VARIABLES_OPERACION(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener todas las variables utilizadas en una operación dada.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         input_str (str): Código identificativo de la operación. Para consultar las operaciones disponibles usar la mcp tool get_available_operations
         params (dict): Pueden ser los siguientes
             page: la respuesta está paginada. Se ofrece un máximo de 500 elementos por página para no ralentizar la respuesta. Para consultar las páginas siguientes, se utiliza el parámetro page.
@@ -241,13 +271,13 @@ async def get_variables_operation(language: str, input_str: Optional[str] = None
 
     return await make_ine_request(INE_API_URL_BASE, language, "VARIABLES_OPERACION", input_str, params)
 
-@mcp.tool() #VALORES_VARIABLE OK
-async def get_variables_values(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_VALORES_VARIABLE(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener todos los valores para una variable específica.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         input_str (str): Código identificador de la variable. Para consultar las variables disponibles usar la mcp tool get_variables
         params (dict): Pueden ser los siguientes
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos del parámetro: 0, 1 y 2.
@@ -257,13 +287,13 @@ async def get_variables_values(language: str, input_str: Optional[str] = None, p
 
     return await make_ine_request(INE_API_URL_BASE, language, "VALORES_VARIABLE", input_str, params)
 
-@mcp.tool() #VALORES_VARIABLEOPERACION OK
-async def get_variable_values_operation(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_VALORES_VARIABLEOPERACION(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener todos los valores para una variable específica de una operación dada.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         input_str (str): Códigos identificadores de la variable y de la operación. Para consultar las operaciones disponibles usar la mcp tool get_available_operations y para consultar las variables disponibles usar la mcp tool get_variables
         params (dict): Pueden ser los siguientes
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos del parámetro: 0, 1 y 2.
@@ -273,13 +303,19 @@ async def get_variable_values_operation(language: str, input_str: Optional[str] 
 
     return await make_ine_request(INE_API_URL_BASE, language, "VALORES_VARIABLEOPERACION", input_str, params)
 
-@mcp.tool() #TABLAS_OPERACION OK
-async def get_operation_tables(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_and_filter_TABLAS_OPERACION(
+    language: str, 
+    input_str: Optional[str] = None, 
+    params: Optional[dict] = None,
+    search_terms: Optional[List[str]] = None,
+    use_regex: bool = False
+) -> dict:
     """
-    Obtener un listado de todas las tablas de una operación disponible en la API del INE.
+    Obtener un listado de todas las tablas de una operación disponible en la API del INE, con posibilidad de filtrarlas.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         Input (str): Código identificativo de la operación. Para consultar las operaciones disponibles usar la mcp tool get_available_operations
         params (dict): Pueden ser los siguientes
             det: nivel de detalle de la información mostrada. Valores válidos: 0, 1 y 2.
@@ -287,23 +323,32 @@ async def get_operation_tables(language: str, input_str: Optional[str] = None, p
                 geo=1: resultados por comunidades autónomas, provincias, municipios y otras desagregaciones.
                 geo=0: Resultados nacionales.
                 tip: obtener la respuesta de las peticiones de modo más amigable (`A’).
+        search_terms (List[str], optional): Lista de palabras clave o patrones a buscar.
+        use_regex (bool): Si True, activa búsqueda por expresión regular.
             
     Returns:
-        dict (JSON): Información de las tablas asociadas a la operación: identificador Tempus3 de la tabla, nombre de la tabla, código con información del nivel geográfico y clasificación, objeto Tempus3 periodicidad, objeto Tempus3 publicación, objeto Tempus3 periodo inicio, año inicio, PubFechaAct dentro de la publicación , FechaRef_fin y última modificación.
+        dict (JSON): Diccionario con todas las tablas y las filtradas (si aplica): identificador Tempus3 de la tabla, nombre de la tabla, código con información del nivel geográfico y clasificación, objeto Tempus3 periodicidad, objeto Tempus3 publicación, objeto Tempus3 periodo inicio, año inicio, PubFechaAct dentro de la publicación , FechaRef_fin y última modificación.
             FechaRef_fin: nulo cuando el último periodo publicado coincide con el de la publicación fecha, en otro caso, cuando la tabla está cortada en un periodo anterior al de la publicación fecha, es sustituido por Fk_perido_fin/ Anyo_perido_fin (fecha del último dato publicado). Consultar https://servicios.ine.es/wstempus/js/ES/TABLAS_OPERACION/33.
             PubFechaAct = contiene la última fecha de actualización de la tabla y el último periodo-año publicado.
     """
 
-    return await make_ine_request(INE_API_URL_BASE, language, "TABLAS_OPERACION", input_str, params)
+    tablas = await make_ine_request(INE_API_URL_BASE, language, "TABLAS_OPERACION", input_str, params)
 
-@mcp.tool() #GRUPOS_TABLA OK
-async def get_table_groups(language: str, input_str: Optional[str] = None) -> dict:
+    if search_terms:
+        filtradas = filter_dict_by_nombre(tablas, search_terms, use_regex)
+        return {"tablas filtradas": filtradas}
+    else:
+        #filtradas = []
+        return {"tablas": tablas}
+
+@mcp.tool()
+async def get_GRUPOS_TABLA(language: str, input_str: Optional[str] = None) -> dict:
     """
     Obtener todos los grupos para una tabla específica. Una tabla está definida por diferentes grupos o combos de selección y cada uno de ellos por los valores que toman una o varias variables.
 
     Args:
-        language (str): puede ser ES o EN.
-        input_str (str): Código identificativo de la tabla. Para obtener el código de una tabla usar la mcp tool get_publications.
+        language (str): ES o EN.
+        input_str (str): Código identificativo de la tabla. Para obtener el código de una tabla usar la mcp tool get_and_filter_PUBLICACIONES.
 
     Returns:
         dict (JSON): Grupos de valores que definen la tabla: identificador Tempus3 del grupo y nombre del grupo.
@@ -312,13 +357,13 @@ async def get_table_groups(language: str, input_str: Optional[str] = None) -> di
 
     return await make_ine_request(INE_API_URL_BASE, language, "GRUPOS_TABLA", input_str, params)
 
-@mcp.tool() #VALORES_GRUPOSTABLA OK
-async def get_values_tables_groups(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_VALORES_GRUPOSTABLA(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener todos los valores de un grupo específico para una tabla dada. Una tabla está definida por diferentes grupos o combos de selección y cada uno de ellos por los valores que toman una o varias variables.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         Input (str): Códigos identificativos de la tabla y del grupo. Para consultar los grupos de una tabla usar la mcp tool get_table_groups
         params (dict): Pueden ser los siguientes
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos del parámetro: 0, 1 y 2.
@@ -328,14 +373,14 @@ async def get_values_tables_groups(language: str, input_str: Optional[str] = Non
     """
     return await make_ine_request(INE_API_URL_BASE, language, "VALORES_GRUPOSTABLA", input_str, params)
 
-@mcp.tool() #SERIE OK
-async def get_series(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_SERIE(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener una serie específica.
 
     Args:
-        language (str): puede ser ES o EN.
-        Input (str): Código identificativo de la serie. Para obtener el código de una serie usar la mcp tool get_publications.
+        language (str): ES o EN.
+        Input (str): Código identificativo de la serie. Para obtener el código de una serie usar la mcp tool get_and_filter_PUBLICACIONES.
         params (dict): Pueden ser los siguientes
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos del parámetro: 0, 1 y 2.
             tip: obtener la respuesta de las peticiones de modo más amigable (`A´), incluir metadatos (`M´) o ambos (`AM´).
@@ -347,8 +392,8 @@ async def get_series(language: str, input_str: Optional[str] = None, params: Opt
     """
     return await make_ine_request(INE_API_URL_BASE, language, "SERIE", input_str, params)
 
-@mcp.tool() #SERIES_OPERACION OK
-async def get_series_operation(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_SERIES_OPERACION(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener todas las series de una operación.
 
@@ -365,14 +410,14 @@ async def get_series_operation(language: str, input_str: Optional[str] = None, p
     """
     return await make_ine_request(INE_API_URL_BASE, language, "SERIES_OPERACION", input_str, params)
 
-@mcp.tool() #VALORES_SERIE OK
-async def get_series_values(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_VALORES_SERIE(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener los valores y variables que definen una serie.
 
     Args:
-        language (str): puede ser ES o EN.
-        Input (str): Código identificativo de la serie. Para obtener el código de una serie usar la mcp tool get_publications.
+        language (str): ES o EN.
+        Input (str): Código identificativo de la serie. Para obtener el código de una serie usar la mcp tool get_and_filter_PUBLICACIONES.
         params (dict). Pueden ser los siguientes:
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos del parámetro: 0, 1 y 2.
 
@@ -381,14 +426,14 @@ async def get_series_values(language: str, input_str: Optional[str] = None, para
     """
     return await make_ine_request(INE_API_URL_BASE, language, "VALORES_SERIE", input_str, params)
 
-@mcp.tool() #SERIES_TABLA OK
-async def get_series_tables(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_SERIES_TABLA(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener todas las series de una tabla específica.
 
     Args:
-        language (str): puede ser ES o EN.
-        Input (str): Código identificativo de la serie. Para obtener el código de una serie usar la mcp tool get_publications.
+        language (str): ES o EN.
+        Input (str): Código identificativo de la serie. Para obtener el código de una serie usar la mcp tool get_and_filter_PUBLICACIONES.
         params (dict). Pueden ser los siguientes:
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos del parámetro: 0, 1 y 2.
             tip: obtener la respuesta de las peticiones de modo más amigable (`A´), incluir metadatos (`M´) o ambos (`AM´).
@@ -398,13 +443,13 @@ async def get_series_tables(language: str, input_str: Optional[str] = None, para
     """
     return await make_ine_request(INE_API_URL_BASE, language, "SERIES_TABLA", input_str, params)
 
-@mcp.tool() #SERISERIE_METADATAOPERACIONES_TABLA OK
-async def get_series_metadata_operations(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_SERIE_METADATAOPERACION(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener series pertenecientes a una operación dada utilizando un filtro.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         Input (str): Código identificativo de la operación. Para consultar las operaciones disponibles usar la mcp tool get_available_operations
         params (dict). Pueden ser los siguientes:
             p: id de la periodicidad de las series. Periodicidades comunes: 1 (mensual), 3 (trimestral), 6 (semestral), 12 (anual). Para ver una lista de las periodicidades acceder a PERIODICIDADES.
@@ -418,13 +463,13 @@ async def get_series_metadata_operations(language: str, input_str: Optional[str]
     """
     return await make_ine_request(INE_API_URL_BASE, language, "SERIE_METADATAOPERACION", input_str, params)
 
-@mcp.tool() #PERIODICIDADES OK
-async def get_periodicities(language: str) -> dict:
+@mcp.tool()
+async def get_PERIODICIDADES(language: str) -> dict:
     """
     Obtener las periodicidades disponibles.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         
     Returns:
         dict (JSON): Información de las periodicidades disponibles: identificador Tempus3 de la periodicidad, nombre y código.
@@ -434,30 +479,44 @@ async def get_periodicities(language: str) -> dict:
     params = None
     return await make_ine_request(INE_API_URL_BASE, language, "PERIODICIDADES", input_str, params)
 
-@mcp.tool() #PUBLICACIONES OK
-async def get_publications(language: str, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_and_filter_PUBLICACIONES(
+    language: str,
+    params: Optional[dict] = None,
+    search_terms: Optional[List[str]] = None,
+    use_regex: bool = False
+) -> dict:
     """
-    Obtener las publicaciones disponibles.
+    Obtener todas las publicaciones disponibles en la API del INE, con posibilidad de filtrarlas.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         params (dict). Pueden ser los siguientes:
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos son 0, 1 y 2.
             tip: obtener la respuesta de las peticiones de modo más amigable (‘A’).
-    
-    Returns:
-        dict (JSON): Información de todas las publicaciones: identificador Tempus3 de la publicación, nombre, identificador Tempus3 de la periodicidad e identificador Tempus3 de la publicación fecha.
-    """
-    input_str=None
-    return await make_ine_request(INE_API_URL_BASE, language, "PUBLICACIONES", input_str, params)
+        search_terms (List[str], optional): Lista de palabras clave o patrones a buscar.
+        use_regex (bool): Si True, activa búsqueda por expresión regular.
 
-@mcp.tool() #PUBLICACIONES_OPERACION OK
-async def get_publications_operation(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+    Returns:
+        dict (JSON): Información de todas las publicaciones y las filtradas (si aplica): identificador Tempus3 de la publicación, nombre, identificador Tempus3 de la periodicidad e identificador Tempus3 de la publicación fecha.
+    """
+    input = None
+    publicaciones = await make_ine_request(INE_API_URL_BASE, language, "PUBLICACIONES", input, params)
+
+    if search_terms:
+        filtradas = filter_dict_by_nombre(publicaciones, search_terms, use_regex)
+        return {"publicaciones filtradas": filtradas}
+    else:
+        #filtradas = []
+        return {"publicaciones": publicaciones}
+
+@mcp.tool()
+async def get_PUBLICACIONES_OPERACION(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener todas las publicaciones para una operación dada.
 
     Args:
-        language (str): puede ser ES o EN.
+        language (str): ES o EN.
         Input (str): Código identificativo de la operación. Para consultar las operaciones disponibles usar la mcp tool get_available_operations
         params (dict). Pueden ser los siguientes:
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos son 0, 1 y 2.
@@ -468,14 +527,14 @@ async def get_publications_operation(language: str, input_str: Optional[str] = N
     """
     return await make_ine_request(INE_API_URL_BASE, language, "PUBLICACIONES_OPERACION", input_str, params)
 
-@mcp.tool() #PUBLICACIONFECHA_PUBLICACION OK
-async def get_publication_date(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
+@mcp.tool()
+async def get_PUBLICACIONFECHA_PUBLICACION(language: str, input_str: Optional[str] = None, params: Optional[dict] = None) -> dict:
     """
     Obtener las fechas de publicación para una publicación dada.
 
     Args:
-        language (str): puede ser ES o EN.
-        Input (str): Código identificativo de la publicación. Para obtener una lista de las publicaciones usar las mcp tools get_publications y get_publications_operation
+        language (str): ES o EN.
+        Input (str): Código identificativo de la publicación. Para obtener una lista de las publicaciones usar las mcp tools get_and_filter_PUBLICACIONES y get_and_filter_PUBLICACIONES_operation
         params (dict). Pueden ser los siguientes:
             det: ofrece mayor nivel de detalle de la información mostrada. Valores válidos son 0, 1 y 2.
             tip: obtener la respuesta de las peticiones de modo más amigable (‘A’).
@@ -484,8 +543,6 @@ async def get_publication_date(language: str, input_str: Optional[str] = None, p
         dict (JSON): Información de todas las publicaciones de una operación: identificador Tempus3 de la publicación, nombre, identificador Tempus3 de la periodicidad e identificador Tempus3 de la publicación fecha.
     """
     return await make_ine_request(INE_API_URL_BASE, language, "PUBLICACIONFECHA_PUBLICACION", input_str, params)
-
-
 
 # Main function
 def main():
