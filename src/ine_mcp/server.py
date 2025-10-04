@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 # Initialize FastMCP server
 mcp = FastMCP(
     "ine-mcp",
-    description="MCP server for querying the INE API (Spanish National Statistics Institute)"
 )
 
 # Constants
